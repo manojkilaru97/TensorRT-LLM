@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Tuple, Union
+import re
+import json
+import uuid
 
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
@@ -40,6 +43,9 @@ class ChatPostprocArgs(PostprocArgs):
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
+        default_factory=dict)
+    # Internal state for tool-call parsing per output index
+    tool_call_parser_states: dict[int, "_DeepSeekV3ToolCallParser"] = field(
         default_factory=dict)
 
     @classmethod
@@ -96,6 +102,199 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
     return in_reasoning, content, reasoning_content
 
 
+class _DeepSeekV3ToolCallParser:
+    """
+    Streaming and one-shot parser for DeepSeek V3-style tool call format used by DeepSeek-R1/DeepSeek-V3.
+
+    Format example (multiple calls supported):
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>...<｜tool▁calls▁end｜>
+    
+    Also supports alternative format:
+    <tool_call>
+    {
+      "name": "function_name",
+      "arguments": {...}
+    }
+    </tool_call>
+    """
+
+    def __init__(self):
+        self.bot_token = "<｜tool▁calls▁begin｜>"
+        self.eot_token = "<｜tool▁calls▁end｜>"
+        self._buffer: str = ""
+        self._last_arguments: str = ""
+        self.current_tool_id: int = -1
+        self.current_tool_name_sent: bool = False
+        self.current_tool_call_id: str = ""  # Track the ID for the current tool call
+
+        # regexes for DeepSeek V3 format
+        self.func_block_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n([\s\S]*?)\n```<｜tool▁call▁end｜>"
+        
+        # regexes for alternative format
+        self.alt_tool_call_regex = r"<tool_call>\s*\{[\s\S]*?\}\s*</tool_call>"
+        self.alt_tool_detail_regex = r"<tool_call>\s*\{\s*\"name\"\s*:\s*\"([^\"]+)\"\s*,\s*\"arguments\"\s*:\s*(\{[\s\S]*?\})\s*\}\s*</tool_call>"
+
+    @staticmethod
+    def _is_complete_json(s: str) -> bool:
+        try:
+            json.loads(s)
+            return True
+        except Exception:
+            return False
+
+    def parse_stream(self, new_text: str) -> Tuple[list[ToolCall], str]:
+        """Parse a streaming delta. Returns (tool_call_deltas, normal_text)."""
+        if not new_text:
+            return [], ""
+        self._buffer += new_text
+        current_text = self._buffer
+
+        # Check for DeepSeek V3 format
+        has_tool_call = (self.bot_token in current_text) or ("<｜tool▁call▁begin｜>" in current_text)
+        
+        # Check for alternative format
+        has_alt_tool_call = "<tool_call>" in current_text
+        
+        if not has_tool_call and not has_alt_tool_call:
+            # Not a tool call. Strip any stray special markers that might leak.
+            cleaned = new_text
+            for tok in (self.eot_token, "```", "<｜tool▁call▁end｜>", "</tool_call>"):
+                cleaned = cleaned.replace(tok, "")
+            self._buffer = ""  # do not accumulate non-tool text
+            return [], cleaned
+
+        # Try DeepSeek V3 format first
+        if has_tool_call:
+            # Try to partially match a tool call (without requiring closing markers)
+            partial = re.search(
+                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n([\s\S]*)",
+                string=current_text,
+                flags=re.DOTALL,
+            )
+
+            deltas: list[ToolCall] = []
+            if partial:
+                func_name = partial.group(2).strip()
+                func_args_raw = partial.group(3)
+
+                # Initialize tracking for first tool call
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.current_tool_name_sent = False
+                    self._last_arguments = ""
+                    # Generate a unique ID for this tool call that will be reused across all chunks
+                    self.current_tool_call_id = f"chatcmpl-tool-{uuid.uuid4().hex}"
+
+                if not self.current_tool_name_sent:
+                    deltas.append(
+                        ToolCall(id=self.current_tool_call_id, function=FunctionCall(name=func_name, arguments=""))
+                    )
+                    self.current_tool_name_sent = True
+                else:
+                    # stream only the diff of arguments
+                    if func_args_raw.startswith(self._last_arguments):
+                        argument_diff = func_args_raw[len(self._last_arguments):]
+                    else:
+                        argument_diff = func_args_raw
+                    if argument_diff:
+                        deltas.append(
+                            ToolCall(id=self.current_tool_call_id, function=FunctionCall(name=func_name, arguments=argument_diff))
+                        )
+                        self._last_arguments += argument_diff
+
+                # If json is complete, consume the tool block from buffer and reset state for next tool
+                if self._is_complete_json(func_args_raw):
+                    # Remove the first completed block from buffer
+                    match = re.search(self.func_block_regex, current_text, re.DOTALL)
+                    if match:
+                        self._buffer = current_text[match.end():]
+                    else:
+                        self._buffer = ""
+                    # reset tool state for the next tool
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    # Generate new ID for the next tool call
+                    self.current_tool_call_id = f"chatcmpl-tool-{uuid.uuid4().hex}"
+
+                return deltas, ""
+
+        # Try alternative format for streaming
+        if has_alt_tool_call:
+            # Look for complete tool calls in alternative format
+            complete_matches = re.findall(self.alt_tool_call_regex, current_text, re.DOTALL)
+            if complete_matches:
+                deltas: list[ToolCall] = []
+                for match in complete_matches:
+                    detail_match = re.search(self.alt_tool_detail_regex, match, re.DOTALL)
+                    if detail_match:
+                        func_name = detail_match.group(1).strip()
+                        func_args_str = detail_match.group(2).strip()
+                        try:
+                            json.loads(func_args_str)
+                            deltas.append(ToolCall(function=FunctionCall(name=func_name, arguments=func_args_str)))
+                            # Remove processed tool call from buffer
+                            self._buffer = self._buffer.replace(match, "")
+                        except Exception:
+                            continue
+                return deltas, ""
+
+        # Fallback
+        return [], ""
+
+    def detect_and_parse(self, text: str) -> Tuple[str, list[ToolCall]]:
+        # First try DeepSeek V3 format
+        idx = text.find(self.bot_token)
+        if idx != -1:
+            normal_text = text[:idx].strip()
+            calls: list[ToolCall] = []
+            try:
+                for block in re.findall(self.func_block_regex, text, re.DOTALL):
+                    m = re.search(self.func_detail_regex, block, re.DOTALL)
+                    if not m:
+                        continue
+                    func_name = m.group(2).strip()
+                    func_args = m.group(3)
+                    # Ensure valid JSON; if invalid, skip
+                    try:
+                        json.loads(func_args)
+                    except Exception:
+                        continue
+                    calls.append(ToolCall(function=FunctionCall(name=func_name, arguments=func_args)))
+                return normal_text, calls
+            except Exception:
+                pass
+        
+        # Try alternative format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+        alt_matches = re.findall(self.alt_tool_call_regex, text, re.DOTALL)
+        if alt_matches:
+            calls: list[ToolCall] = []
+            normal_text = text
+            try:
+                for match in alt_matches:
+                    # Remove the tool call from normal text
+                    normal_text = normal_text.replace(match, "").strip()
+                    
+                    # Parse the tool call
+                    detail_match = re.search(self.alt_tool_detail_regex, match, re.DOTALL)
+                    if detail_match:
+                        func_name = detail_match.group(1).strip()
+                        func_args_str = detail_match.group(2).strip()
+                        # Ensure valid JSON
+                        try:
+                            json.loads(func_args_str)
+                            calls.append(ToolCall(function=FunctionCall(name=func_name, arguments=func_args_str)))
+                        except Exception:
+                            continue
+                return normal_text, calls
+            except Exception:
+                pass
+        
+        # No tool calls found
+        return text, []
+
+
 @nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> List[str]:
 
@@ -144,19 +343,37 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
         in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
             args, i, delta_text, True)
 
-        if args.tool_choice and type(
-                args.tool_choice) is ChatCompletionNamedToolChoiceParam:
-            delta_message = DeltaMessage(tool_calls=[
-                ToolCall(function=FunctionCall(
-                    name=args.tool_choice.function.name, arguments=delta_text))
-            ])
-        else:
-            if in_reasoning:
-                delta_message = DeltaMessage(
-                    reasoning_content=reasoning_delta_text)
+        # DeepSeek R1/V3 tool-call streaming detection (enabled when reasoning_parser indicates DeepSeek and tools are provided)
+        tool_delta_message: Optional[DeltaMessage] = None
+        # Only attempt tool-call parsing when not in reasoning and we have actual text
+        if (args.tools and args.reasoning_parser == "deepseek-r1" and not in_reasoning
+                and delta_text):
+            if i not in args.tool_call_parser_states:
+                args.tool_call_parser_states[i] = _DeepSeekV3ToolCallParser()
+            parser = args.tool_call_parser_states[i]
+            tool_deltas, residual_text = parser.parse_stream(delta_text)
+            if tool_deltas:
+                tool_delta_message = DeltaMessage(tool_calls=tool_deltas)
             else:
-                delta_message = DeltaMessage(
-                    content=delta_text, reasoning_content=reasoning_delta_text)
+                # overwrite delta_text with residual if any
+                delta_text = residual_text
+
+        if tool_delta_message is not None:
+            delta_message = tool_delta_message
+        else:
+            if args.tool_choice and type(
+                    args.tool_choice) is ChatCompletionNamedToolChoiceParam:
+                delta_message = DeltaMessage(tool_calls=[
+                    ToolCall(function=FunctionCall(
+                        name=args.tool_choice.function.name, arguments=delta_text))
+                ])
+            else:
+                if in_reasoning:
+                    delta_message = DeltaMessage(
+                        reasoning_content=reasoning_delta_text)
+                else:
+                    delta_message = DeltaMessage(
+                        content=delta_text, reasoning_content=reasoning_delta_text)
 
         choice = ChatCompletionResponseStreamChoice(index=i,
                                                     delta=delta_message,
@@ -202,22 +419,38 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
         _, text, reasoning_text = apply_reasoning_parser(
             args, output.index, output.text, False)
 
-        if args.tool_choice and isinstance(
-                args.tool_choice,
-                ChatCompletionNamedToolChoiceParam):
+        # Try DeepSeek tool-call detection for non-streaming paths
+        tool_calls_detected: list[ToolCall] = []
+        if args.tools and args.reasoning_parser == "deepseek-r1":
+            parser = args.tool_call_parser_states.get(output.index)
+            if parser is None:
+                parser = _DeepSeekV3ToolCallParser()
+            normal_text, tool_calls_detected = parser.detect_and_parse(output.text)
+            if tool_calls_detected:
+                text = normal_text
+
+        if tool_calls_detected:
             message = ChatMessage(
                 role=role,
                 content="",
-                tool_calls=[
-                    ToolCall(function=FunctionCall(
-                        name=args.tool_choice.function.name,
-                        arguments=text))
-                ])
+                tool_calls=tool_calls_detected)
         else:
-            if text is None:
-                text = ""
-            message = ChatMessage(
-                role=role, content=text, reasoning_content=reasoning_text)
+            if args.tool_choice and isinstance(
+                    args.tool_choice,
+                    ChatCompletionNamedToolChoiceParam):
+                message = ChatMessage(
+                    role=role,
+                    content="",
+                    tool_calls=[
+                        ToolCall(function=FunctionCall(
+                            name=args.tool_choice.function.name,
+                            arguments=text))
+                    ])
+            else:
+                if text is None:
+                    text = ""
+                message = ChatMessage(
+                    role=role, content=text, reasoning_content=reasoning_text)
         disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
@@ -227,6 +460,10 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
             disaggregated_params=disaggregated_params,
             avg_decoded_tokens_per_iter=getattr(rsp, 'avg_decoded_tokens_per_iter', None),
         )
+
+        # If tool calls are detected in full response, set finish_reason accordingly
+        if tool_calls_detected:
+            choice.finish_reason = "tool_calls"
 
         if args.return_logprobs:
             choice.logprobs = create_logprobs(output.token_ids, args.tokenizer, output.logprobs)

@@ -126,6 +126,8 @@ class _DeepSeekV3ToolCallParser:
         self.current_tool_id: int = -1
         self.current_tool_name_sent: bool = False
         self.current_tool_call_id: str = ""  # Track the ID for the current tool call
+        self._accumulated_arguments: str = ""  # Track accumulated arguments for streaming
+        self._last_sent_length: int = 0  # Track how much we've already sent
 
         # regexes for DeepSeek V3 format
         self.func_block_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
@@ -137,11 +139,45 @@ class _DeepSeekV3ToolCallParser:
 
     @staticmethod
     def _is_complete_json(s: str) -> bool:
+        """Check if string is valid and complete JSON."""
+        if not s or not s.strip():
+            return False
         try:
             json.loads(s)
             return True
-        except Exception:
+        except (json.JSONDecodeError, ValueError, TypeError):
             return False
+    
+    @staticmethod
+    def _validate_function_name(name: str) -> bool:
+        """Validate function name follows expected patterns."""
+        if not name or not isinstance(name, str):
+            return False
+        # Function names should be alphanumeric with underscores, reasonable length
+        return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]{0,63}$', name))
+    
+    @staticmethod
+    def _sanitize_arguments(args_str: str) -> str:
+        """Sanitize and validate JSON arguments string."""
+        if not args_str:
+            return "{}"
+        
+        # Remove any potential injection attempts or malformed content
+        args_str = args_str.strip()
+        
+        # Basic validation - should start with { and end with }
+        if not (args_str.startswith('{') and args_str.endswith('}')):
+            return "{}"
+        
+        try:
+            # Validate it's proper JSON
+            parsed = json.loads(args_str)
+            if not isinstance(parsed, dict):
+                return "{}"
+            # Re-serialize to ensure clean JSON
+            return json.dumps(parsed, separators=(',', ':'))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return "{}"
 
     def parse_stream(self, new_text: str) -> Tuple[list[ToolCall], str]:
         """Parse a streaming delta. Returns (tool_call_deltas, normal_text)."""
@@ -177,12 +213,23 @@ class _DeepSeekV3ToolCallParser:
             if partial:
                 func_name = partial.group(2).strip()
                 func_args_raw = partial.group(3)
+                
+                # Validate function name
+                if not self._validate_function_name(func_name):
+                    # Invalid function name, skip this tool call
+                    return [], ""
+                
+                # Limit argument length to prevent abuse
+                if len(func_args_raw) > 10000:  # 10KB limit
+                    func_args_raw = func_args_raw[:10000]
 
                 # Initialize tracking for first tool call
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.current_tool_name_sent = False
                     self._last_arguments = ""
+                    self._accumulated_arguments = ""
+                    self._last_sent_length = 0
                     # Generate a unique ID for this tool call that will be reused across all chunks
                     self.current_tool_call_id = f"chatcmpl-tool-{uuid.uuid4().hex}"
 
@@ -191,20 +238,52 @@ class _DeepSeekV3ToolCallParser:
                         ToolCall(id=self.current_tool_call_id, function=FunctionCall(name=func_name, arguments=""))
                     )
                     self.current_tool_name_sent = True
+                    self._accumulated_arguments = func_args_raw
+                    self._last_sent_length = 0
                 else:
-                    # stream only the diff of arguments
-                    if func_args_raw.startswith(self._last_arguments):
-                        argument_diff = func_args_raw[len(self._last_arguments):]
-                    else:
-                        argument_diff = func_args_raw
-                    if argument_diff:
-                        deltas.append(
-                            ToolCall(id=self.current_tool_call_id, function=FunctionCall(name=func_name, arguments=argument_diff))
+                    # Update accumulated arguments
+                    self._accumulated_arguments = func_args_raw
+                    
+                    # Only send delta if we have new content and it's substantial
+                    if len(self._accumulated_arguments) > self._last_sent_length:
+                        # Send incremental chunks, but not character by character
+                        # Wait for at least a few characters or complete tokens before sending
+                        new_content = self._accumulated_arguments[self._last_sent_length:]
+                        
+                        # Only send if we have substantial new content (avoid single character fragments)
+                        # or if we have a complete JSON structure
+                        should_send = (
+                            len(new_content) >= 3 or  # At least 3 characters
+                            new_content.endswith('"') or  # Complete string value
+                            new_content.endswith(',') or  # Complete field
+                            new_content.endswith('}') or  # Complete object
+                            self._is_complete_json(self._accumulated_arguments)  # Complete JSON
                         )
-                        self._last_arguments += argument_diff
+                        
+                        if should_send:
+                            try:
+                                deltas.append(
+                                    ToolCall(id=self.current_tool_call_id, function=FunctionCall(name=func_name, arguments=new_content))
+                                )
+                                self._last_sent_length = len(self._accumulated_arguments)
+                            except Exception:
+                                # If tool call creation fails, skip this delta
+                                pass
 
-                # If json is complete, consume the tool block from buffer and reset state for next tool
+                # If json is complete, send any remaining content and reset state for next tool
                 if self._is_complete_json(func_args_raw):
+                    # Send any remaining unsent content
+                    if len(self._accumulated_arguments) > self._last_sent_length:
+                        remaining_content = self._accumulated_arguments[self._last_sent_length:]
+                        if remaining_content:
+                            try:
+                                deltas.append(
+                                    ToolCall(id=self.current_tool_call_id, function=FunctionCall(name=func_name, arguments=remaining_content))
+                                )
+                            except Exception:
+                                # If tool call creation fails, skip this delta
+                                pass
+                    
                     # Remove the first completed block from buffer
                     match = re.search(self.func_block_regex, current_text, re.DOTALL)
                     if match:
@@ -214,6 +293,8 @@ class _DeepSeekV3ToolCallParser:
                     # reset tool state for the next tool
                     self.current_tool_id += 1
                     self._last_arguments = ""
+                    self._accumulated_arguments = ""
+                    self._last_sent_length = 0
                     self.current_tool_name_sent = False
                     # Generate new ID for the next tool call
                     self.current_tool_call_id = f"chatcmpl-tool-{uuid.uuid4().hex}"
@@ -231,13 +312,20 @@ class _DeepSeekV3ToolCallParser:
                     if detail_match:
                         func_name = detail_match.group(1).strip()
                         func_args_str = detail_match.group(2).strip()
-                        try:
-                            json.loads(func_args_str)
-                            deltas.append(ToolCall(function=FunctionCall(name=func_name, arguments=func_args_str)))
-                            # Remove processed tool call from buffer
-                            self._buffer = self._buffer.replace(match, "")
-                        except Exception:
+                        
+                        # Validate function name and arguments
+                        if not self._validate_function_name(func_name):
                             continue
+                        
+                        # Sanitize and validate arguments
+                        clean_args = self._sanitize_arguments(func_args_str)
+                        if clean_args != "{}":  # Only proceed if we have valid arguments
+                            try:
+                                deltas.append(ToolCall(function=FunctionCall(name=func_name, arguments=clean_args)))
+                                # Remove processed tool call from buffer
+                                self._buffer = self._buffer.replace(match, "")
+                            except Exception:
+                                continue
                 return deltas, ""
 
         # Fallback
@@ -256,12 +344,20 @@ class _DeepSeekV3ToolCallParser:
                         continue
                     func_name = m.group(2).strip()
                     func_args = m.group(3)
-                    # Ensure valid JSON; if invalid, skip
+                    
+                    # Validate function name
+                    if not self._validate_function_name(func_name):
+                        continue
+                    
+                    # Sanitize and validate arguments
+                    clean_args = self._sanitize_arguments(func_args)
+                    if clean_args == "{}" and func_args.strip():  # Skip if sanitization failed on non-empty input
+                        continue
+                    
                     try:
-                        json.loads(func_args)
+                        calls.append(ToolCall(function=FunctionCall(name=func_name, arguments=clean_args)))
                     except Exception:
                         continue
-                    calls.append(ToolCall(function=FunctionCall(name=func_name, arguments=func_args)))
                 return normal_text, calls
             except Exception:
                 pass
@@ -281,12 +377,18 @@ class _DeepSeekV3ToolCallParser:
                     if detail_match:
                         func_name = detail_match.group(1).strip()
                         func_args_str = detail_match.group(2).strip()
-                        # Ensure valid JSON
-                        try:
-                            json.loads(func_args_str)
-                            calls.append(ToolCall(function=FunctionCall(name=func_name, arguments=func_args_str)))
-                        except Exception:
+                        
+                        # Validate function name
+                        if not self._validate_function_name(func_name):
                             continue
+                        
+                        # Sanitize and validate arguments
+                        clean_args = self._sanitize_arguments(func_args_str)
+                        if clean_args != "{}":  # Only proceed if we have valid arguments
+                            try:
+                                calls.append(ToolCall(function=FunctionCall(name=func_name, arguments=clean_args)))
+                            except Exception:
+                                continue
                 return normal_text, calls
             except Exception:
                 pass

@@ -323,6 +323,34 @@ class SamplingParams:
         self.logprobs = self.logprobs and int(self.logprobs)
         self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
+        # Normalize executor-sensitive fields/ranges
+        if self.temperature is not None and self.temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
+        if self.top_p is not None:
+            # C++ requires topP.value() > 0.f
+            if self.top_p <= 0 or self.top_p > 1:
+                raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
+        if self.top_k is not None and self.top_k < 0:
+            raise ValueError(f"top_k must be >= 0, got {self.top_k}")
+        if self.top_p_min is not None and self.top_p_min < 0:
+            raise ValueError(f"top_p_min must be >= 0, got {self.top_p_min}")
+        if self.min_p is not None and self.min_p < 0:
+            raise ValueError(f"min_p must be >= 0, got {self.min_p}")
+        if self.repetition_penalty is not None and self.repetition_penalty <= 0:
+            raise ValueError(
+                f"repetition_penalty must be > 0, got {self.repetition_penalty}")
+        if self.length_penalty is not None and self.length_penalty <= 0:
+            raise ValueError(f"length_penalty must be > 0, got {self.length_penalty}")
+        if self.min_tokens is not None and self.min_tokens < 0:
+            raise ValueError(f"min_tokens must be >= 0, got {self.min_tokens}")
+        if self.no_repeat_ngram_size is not None and self.no_repeat_ngram_size < 0:
+            raise ValueError(
+                f"no_repeat_ngram_size must be >= 0, got {self.no_repeat_ngram_size}")
+
+        # Pydantic models use bool for early_stopping; backend expects Optional[int]
+        if isinstance(self.early_stopping, bool):
+            self.early_stopping = 1 if self.early_stopping else None
+
     @property
     def _greedy_decoding(self) -> bool:
         return (
